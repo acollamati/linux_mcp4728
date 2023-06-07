@@ -1,0 +1,18 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "toradex,colibri-imx7d",
+		     "toradex,colibri-imx7d-emmc";
+};
+
+&i2c4 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	mcp4728_dac: mcp4728_dac@64 {
+		compatible = "microchip,mcp4728";
+		reg = <0x64>;
+		status = "okay";
+		vdd-supply = < &reg_module_3v3 >;
+	};
+};
