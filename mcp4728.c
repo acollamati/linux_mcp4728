@@ -127,7 +127,8 @@ static ssize_t mcp4728_store_eeprom(struct device *dev,
 		outbuf[offset] = ch->ref_mode << MCP4728_CMD_VREF_POS;
 		if (data->powerdown) {
 			u8 mcp4728_pd_mode = ch->pd_mode + 1;
-			outbuf[1] |= (mcp4728_pd_mode + 1) << MCP4728_CMD_PDMODE_POS;
+
+			outbuf[1] |= mcp4728_pd_mode << MCP4728_CMD_PDMODE_POS;
 		}
 
 		outbuf[offset] |= ch->g_mode << MCP4728_CMD_GAIN_POS;
@@ -278,7 +279,8 @@ static int mcp4728_program_channel_cfg(int channel, struct iio_dev *indio_dev)
 	outbuf[1] = ch->ref_mode << MCP4728_CMD_VREF_POS;
 	if(data->powerdown){
 		u8 mcp4728_pd_mode = ch->pd_mode + 1;
-		outbuf[1] |= (mcp4728_pd_mode + 1) << MCP4728_CMD_PDMODE_POS;
+
+		outbuf[1] |= mcp4728_pd_mode << MCP4728_CMD_PDMODE_POS;
 	}
 
 	outbuf[1] |= ch->g_mode << MCP4728_CMD_GAIN_POS;
