@@ -49,10 +49,6 @@
 #define MCP4728_WRITE_EEPROM_LEN \
 	(1 + MCP4728_N_CHANNELS * 2) // Sequential Write
 
-#define MCP472X_REF_VDD 0x00
-#define MCP472X_REF_VREF_UNBUFFERED 0x02
-#define MCP472X_REF_VREF_BUFFERED 0x03
-
 enum vref_mode {
 	MCP4728_VREF_EXTERNAL_VDD = 0,
 	MCP4728_VRED_INTERNAL_2048mV = 1,
@@ -152,8 +148,8 @@ static ssize_t mcp4728_store_eeprom(struct device *dev,
 	}
 
 	if (tries < 0) {
-		dev_err(&data->client->dev,
-			"%s failed, incomplete\n", __func__);
+		dev_err(&data->client->dev, "%s failed, incomplete\n",
+			__func__);
 		return -EIO;
 	}
 	return len;
@@ -170,9 +166,48 @@ static const struct attribute_group mcp4728_attribute_group = {
 	.attrs = mcp4728_attributes,
 };
 
-static const char *const mcp4728_powerdown_modes[] = { "1kohm_to_gnd",
-						       "100kohm_to_gnd",
-						       "500kohm_to_gnd" };
+enum chip_id {
+	MCP4728,
+};
+
+static int mcp4728_program_channel_cfg(int channel, struct iio_dev *indio_dev)
+{
+	struct mcp4728_data *data = iio_priv(indio_dev);
+	struct mcp4728_channel_data *ch = &(data->channel_data[channel]);
+	u8 outbuf[3];
+	int ret;
+
+	outbuf[0] = MCP4728_MW_CMD << MCP4728_CMD_POS; // Command ID
+	outbuf[0] |= channel << MCP4728_CMD_CH_SEL_POS; // Channel Selector
+	outbuf[0] |= 0; // UDAC = 0
+
+	outbuf[1] = ch->ref_mode << MCP4728_CMD_VREF_POS;
+	if (data->powerdown) {
+		u8 mcp4728_pd_mode = ch->pd_mode + 1;
+
+		outbuf[1] |= mcp4728_pd_mode << MCP4728_CMD_PDMODE_POS;
+	}
+
+	outbuf[1] |= ch->g_mode << MCP4728_CMD_GAIN_POS;
+
+	outbuf[1] |= ch->dac_value >> 8;
+	outbuf[2] = ch->dac_value & 0xff;
+
+	ret = i2c_master_send(data->client, outbuf, 3);
+	if (ret < 0)
+		return ret;
+	else if (ret != 3)
+		return -EIO;
+	else
+		return 0;
+}
+
+// powerdown mode
+static const char *const mcp4728_powerdown_modes[] = {
+	"1kohm_to_gnd",
+	"100kohm_to_gnd",
+	"500kohm_to_gnd"
+};
 
 static int mcp4728_get_powerdown_mode(struct iio_dev *indio_dev,
 				      const struct iio_chan_spec *chan)
@@ -226,17 +261,98 @@ static ssize_t mcp4728_write_powerdown(struct iio_dev *indio_dev,
 	return len;
 }
 
-enum chip_id {
-	MCP4728,
+static const struct iio_enum mcp4728_powerdown_mode_enum = {
+	.items = mcp4728_powerdown_modes,
+	.num_items = ARRAY_SIZE(mcp4728_powerdown_modes),
+	.get = mcp4728_get_powerdown_mode,
+	.set = mcp4728_set_powerdown_mode,
 };
 
-static const struct iio_enum mcp472x_powerdown_mode_enum[] = {
-	{
-		.items = mcp4728_powerdown_modes,
-		.num_items = ARRAY_SIZE(mcp4728_powerdown_modes),
-		.get = mcp4728_get_powerdown_mode,
-		.set = mcp4728_set_powerdown_mode,
-	},
+// vref mode
+static const char *const mcp4728_vref_modes[] = {
+	"vdd_ext",
+	"internal",
+};
+
+static int mcp4728_get_vref_mode(struct iio_dev *indio_dev,
+				 const struct iio_chan_spec *chan)
+{
+	struct mcp4728_data *data = iio_priv(indio_dev);
+
+	return data->channel_data[chan->channel].ref_mode;
+}
+
+static int mcp4728_set_vref_mode(struct iio_dev *indio_dev,
+				 const struct iio_chan_spec *chan,
+				 unsigned int mode)
+{
+	struct mcp4728_data *data = iio_priv(indio_dev);
+	int ret;
+
+	data->channel_data[chan->channel].ref_mode = mode;
+
+	if (mode == MCP4728_VREF_EXTERNAL_VDD &&
+	    data->channel_data[chan->channel].g_mode == MCP4728_GAIN_X2) {
+		dev_warn(
+			&data->client->dev,
+			"CH%d: Gain x2 not effective when vref is vdd, force to x1",
+			chan->channel);
+		data->channel_data[chan->channel].g_mode = MCP4728_GAIN_X1;
+	}
+
+	ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
+
+	return ret;
+}
+static const struct iio_enum mcp4728_vref_mode_enum = {
+	.items = mcp4728_vref_modes,
+	.num_items = ARRAY_SIZE(mcp4728_vref_modes),
+	.get = mcp4728_get_vref_mode,
+	.set = mcp4728_set_vref_mode,
+};
+
+// gain
+static const char *const mcp4728_gain_modes[] = {
+	"x1",
+	"x2",
+};
+
+static int mcp4728_get_gain_mode(struct iio_dev *indio_dev,
+				 const struct iio_chan_spec *chan)
+{
+	struct mcp4728_data *data = iio_priv(indio_dev);
+
+	return data->channel_data[chan->channel].g_mode;
+}
+
+static int mcp4728_set_gain_mode(struct iio_dev *indio_dev,
+				 const struct iio_chan_spec *chan,
+				 unsigned int mode)
+{
+	struct mcp4728_data *data = iio_priv(indio_dev);
+	int ret;
+
+	if (mode == MCP4728_GAIN_X2 &&
+	    data->channel_data[chan->channel].ref_mode ==
+		    MCP4728_VREF_EXTERNAL_VDD) {
+		dev_err(&data->client->dev,
+			"CH%d: Gain x2 not effective when vref is vdd",
+			chan->channel);
+		return -EINVAL;
+	}
+
+	data->channel_data[chan->channel].g_mode = mode;
+
+	ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
+
+	return ret;
+}
+
+static const struct iio_enum mcp4728_gain_mode_enum = {
+	.items = mcp4728_gain_modes,
+	.num_items = ARRAY_SIZE(mcp4728_gain_modes),
+	.get = mcp4728_get_gain_mode,
+	.set = mcp4728_set_gain_mode,
 };
 
 static const struct iio_chan_spec_ext_info mcp4728_ext_info[] = {
@@ -246,10 +362,15 @@ static const struct iio_chan_spec_ext_info mcp4728_ext_info[] = {
 		.write = mcp4728_write_powerdown,
 		.shared = IIO_SEPARATE,
 	},
-	IIO_ENUM("powerdown_mode", IIO_SEPARATE,
-		 &mcp472x_powerdown_mode_enum[MCP4728]),
+	IIO_ENUM("powerdown_mode", IIO_SEPARATE, &mcp4728_powerdown_mode_enum),
 	IIO_ENUM_AVAILABLE("powerdown_mode", IIO_SHARED_BY_TYPE,
-			   &mcp472x_powerdown_mode_enum[MCP4728]),
+			   &mcp4728_powerdown_mode_enum),
+	IIO_ENUM("vref_mode", IIO_SEPARATE, &mcp4728_vref_mode_enum),
+	IIO_ENUM_AVAILABLE("vref_mode", IIO_SHARED_BY_TYPE,
+			   &mcp4728_vref_mode_enum),
+	IIO_ENUM("gain_mode", IIO_SEPARATE, &mcp4728_gain_mode_enum),
+	IIO_ENUM_AVAILABLE("gain_mode", IIO_SHARED_BY_TYPE,
+			   &mcp4728_gain_mode_enum),
 	{},
 };
 
@@ -259,38 +380,6 @@ static const struct iio_chan_spec mcp4728_channels[MCP4728_N_CHANNELS] = {
 	MCP4728_CHAN(2),
 	MCP4728_CHAN(3),
 };
-
-static int mcp4728_program_channel_cfg(int channel, struct iio_dev *indio_dev)
-{
-	struct mcp4728_data *data = iio_priv(indio_dev);
-	struct mcp4728_channel_data *ch = &(data->channel_data[channel]);
-	u8 outbuf[3];
-	int ret;
-
-	outbuf[0] = MCP4728_MW_CMD << MCP4728_CMD_POS; // Command ID
-	outbuf[0] |= channel << MCP4728_CMD_CH_SEL_POS; // Channel Selector
-	outbuf[0] |= 0; // UDAC = 0
-
-	outbuf[1] = ch->ref_mode << MCP4728_CMD_VREF_POS;
-	if (data->powerdown) {
-		u8 mcp4728_pd_mode = ch->pd_mode + 1;
-
-		outbuf[1] |= mcp4728_pd_mode << MCP4728_CMD_PDMODE_POS;
-	}
-
-	outbuf[1] |= ch->g_mode << MCP4728_CMD_GAIN_POS;
-
-	outbuf[1] |= ch->dac_value >> 8;
-	outbuf[2] = ch->dac_value & 0xff;
-
-	ret = i2c_master_send(data->client, outbuf, 3);
-	if (ret < 0)
-		return ret;
-	else if (ret != 3)
-		return -EIO;
-	else
-		return 0;
-}
 
 static int mcp4728_full_scale_mV(u32 *full_scale_mV, int channel,
 				 struct mcp4728_data *data)
@@ -446,6 +535,11 @@ static int mcp4728_init_channels_data(struct mcp4728_data *data)
 			      MCP4728_CMD_PDMODE_POS;
 		ch->g_mode = (r2 & MCP4728_CMD_GAIN_MASK) >>
 			     MCP4728_CMD_GAIN_POS;
+		if (ch->g_mode == MCP4728_GAIN_X2 &&
+		    ch->ref_mode == MCP4728_VREF_EXTERNAL_VDD)
+			dev_warn(&data->client->dev,
+				 "CH%d: Gain x2 not effective when vref is vdd",
+				 i);
 
 		dac_mv = mcp4728_raw_to_mV(ch->dac_value, i, data);
 		dev_info(&data->client->dev,
