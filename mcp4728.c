@@ -24,32 +24,31 @@
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 
+#define MCP4728_RESOLUTION	  12
+#define MCP4728_N_CHANNELS	  4
 
-#define MCP4728_RESOLUTION 12
-#define MCP4728_N_CHANNELS 4
+#define MCP4728_CMD_MASK	  GENMASK(7, 3)
+#define MCP4728_CHSEL_MASK	  GENMASK(2, 1)
+#define MCP4728_UDAC_MASK	  BIT(0)
 
-#define MCP4728_CMD_FIELD	GENMASK(7, 3)
-#define MCP4728_CHSEL_FIELD	GENMASK(2, 1)
-#define MCP4728_UDAC_FIELD	BIT(0)
+#define MCP4728_VREF_MASK	  BIT(7)
+#define MCP4728_PDMODE_MASK	  GENMASK(6, 5)
+#define MCP4728_GAIN_MASK	  BIT(4)
 
-#define MCP4728_VREF_FIELD	BIT(7)
-#define MCP4728_PDMODE_FIELD	GENMASK(6,5)
-#define MCP4728_GAIN_FIELD	BIT(4)
+#define MCP4728_DAC_H_MASK	  GENMASK(3, 0)
+#define MCP4728_DAC_L_MASK	  GENMASK(7, 0)
 
-#define MCP4728_DAC_H_FIELD	GENMASK(3, 0)
-#define MCP4728_DAC_L_FIELD	GENMASK(7, 0)
+#define MCP4728_RDY_MASK	  BIT(7)
 
-#define MCP4728_RDY_FIELD	BIT(7)
-
-#define MCP4728_MW_CMD		0x08 /* Multiwrite Command */
-#define MCP4728_SW_CMD		0x0A /* Sequential Write Command with EEPROM */
+#define MCP4728_MW_CMD		  0x08 /* Multiwrite Command */
+#define MCP4728_SW_CMD		  0x0A /* Sequential Write Command with EEPROM */
 
 #define MCP4728_READ_RESPONSE_LEN (MCP4728_N_CHANNELS * 3 * 2)
-#define MCP4728_WRITE_EEPROM_LEN (1 + MCP4728_N_CHANNELS * 2)
+#define MCP4728_WRITE_EEPROM_LEN  (1 + MCP4728_N_CHANNELS * 2)
 
 enum vref_mode {
-	MCP4728_VREF_EXTERNAL_VDD = 0,
-	MCP4728_VRED_INTERNAL_2048mV = 1,
+	MCP4728_VREF_EXTERNAL_VDD    = 0,
+	MCP4728_VREF_INTERNAL_2048mV = 1,
 };
 
 enum gain_mode {
@@ -70,21 +69,36 @@ struct mcp4728_channel_data {
 	u16 dac_value;
 };
 
+/* MCP4728 Full Scale Ranges
+ * the device available ranges are
+ * - VREF = VDD				FSR = from 0.0V to VDD
+ * - VREF = Internal	Gain = 1	FSR = from 0.0V to VREF
+ * - VREF = Internal	Gain = 2	FSR = from 0.0V to 2*VREF
+ */
+enum mcp4728_scale {
+	MCP4728_SCALE_VDD,
+	MCP4728_SCALE_VINT_NO_GAIN,
+	MCP4728_SCALE_VINT_GAIN_X2,
+	MCP4728_N_SCALES
+};
+
 struct mcp4728_data {
 	struct i2c_client *client;
 	struct regulator *vdd_reg;
 	bool powerdown;
-	struct mcp4728_channel_data channel_data[MCP4728_N_CHANNELS];
+	int scales_avail[MCP4728_N_SCALES * 2];
+	struct mcp4728_channel_data chdata[MCP4728_N_CHANNELS];
 };
 
-#define MCP4728_CHAN(chan) {					\
-	.type = IIO_VOLTAGE,					\
-	.output = 1,						\
-	.indexed = 1,						\
-	.channel = chan,					\
-	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),		\
-	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
-	.ext_info = mcp4728_ext_info,				\
+#define MCP4728_CHAN(chan) {						\
+	.type = IIO_VOLTAGE,						\
+	.output = 1,							\
+	.indexed = 1,							\
+	.channel = chan,						\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW)	|		\
+			      BIT(IIO_CHAN_INFO_SCALE),			\
+	.info_mask_shared_by_type_available = BIT(IIO_CHAN_INFO_SCALE),	\
+	.ext_info = mcp4728_ext_info,					\
 }
 
 static int mcp4728_suspend(struct device *dev);
@@ -110,23 +124,26 @@ static ssize_t mcp4728_store_eeprom(struct device *dev,
 	if (!state)
 		return 0;
 
-	outbuf[0] = FIELD_PREP(MCP4728_CMD_FIELD, MCP4728_SW_CMD);
+	outbuf[0] = FIELD_PREP(MCP4728_CMD_MASK, MCP4728_SW_CMD);
 
 	for (i = 0; i < MCP4728_N_CHANNELS; i++) {
-		struct mcp4728_channel_data *ch = &data->channel_data[i];
-		int offset = 1 + i * 2;
+		struct mcp4728_channel_data *ch = &data->chdata[i];
+		int offset			= 1 + i * 2;
 
-		outbuf[offset] = FIELD_PREP(MCP4728_VREF_FIELD, ch->ref_mode);
+		outbuf[offset] = FIELD_PREP(MCP4728_VREF_MASK, ch->ref_mode);
 
 		if (data->powerdown) {
 			u8 mcp4728_pd_mode = ch->pd_mode + 1;
 
-			outbuf[offset] |= FIELD_PREP(MCP4728_PDMODE_FIELD, mcp4728_pd_mode);
+			outbuf[offset] |= FIELD_PREP(MCP4728_PDMODE_MASK,
+						     mcp4728_pd_mode);
 		}
 
-		outbuf[offset] |= FIELD_PREP(MCP4728_GAIN_FIELD, ch->g_mode);
-		outbuf[offset] |= FIELD_PREP(MCP4728_DAC_H_FIELD, ch->dac_value >> 8);
-		outbuf[offset + 1] = FIELD_PREP(MCP4728_DAC_L_FIELD, ch->dac_value);
+		outbuf[offset] |= FIELD_PREP(MCP4728_GAIN_MASK, ch->g_mode);
+		outbuf[offset] |=
+			FIELD_PREP(MCP4728_DAC_H_MASK, ch->dac_value >> 8);
+		outbuf[offset + 1] =
+			FIELD_PREP(MCP4728_DAC_L_MASK, ch->dac_value);
 	}
 
 	ret = i2c_master_send(data->client, outbuf, MCP4728_WRITE_EEPROM_LEN);
@@ -144,7 +161,7 @@ static ssize_t mcp4728_store_eeprom(struct device *dev,
 		else if (ret != 3)
 			return -EIO;
 
-		if (FIELD_GET(MCP4728_RDY_FIELD, inbuf[0]))
+		if (FIELD_GET(MCP4728_RDY_MASK, inbuf[0]))
 			break;
 	}
 
@@ -169,26 +186,23 @@ static const struct attribute_group mcp4728_attribute_group = {
 
 static int mcp4728_program_channel_cfg(int channel, struct iio_dev *indio_dev)
 {
-	struct mcp4728_data *data = iio_priv(indio_dev);
-	struct mcp4728_channel_data *ch = &data->channel_data[channel];
+	struct mcp4728_data *data	= iio_priv(indio_dev);
+	struct mcp4728_channel_data *ch = &data->chdata[channel];
 	u8 outbuf[3];
 	int ret;
 
-	outbuf[0] = FIELD_PREP(MCP4728_CMD_FIELD, MCP4728_MW_CMD);
-	outbuf[0] |= FIELD_PREP(MCP4728_CHSEL_FIELD, channel);
-	outbuf[0] |= FIELD_PREP(MCP4728_UDAC_FIELD, 0);
+	outbuf[0] = FIELD_PREP(MCP4728_CMD_MASK, MCP4728_MW_CMD);
+	outbuf[0] |= FIELD_PREP(MCP4728_CHSEL_MASK, channel);
+	outbuf[0] |= FIELD_PREP(MCP4728_UDAC_MASK, 0);
 
-	outbuf[1] = FIELD_PREP(MCP4728_VREF_FIELD, ch->ref_mode);
+	outbuf[1] = FIELD_PREP(MCP4728_VREF_MASK, ch->ref_mode);
 
-	if (data->powerdown) {
-		u8 mcp4728_pd_mode = ch->pd_mode + 1;
+	if (data->powerdown)
+		outbuf[1] |= FIELD_PREP(MCP4728_PDMODE_MASK, ch->pd_mode + 1);
 
-		outbuf[1] |= FIELD_PREP(MCP4728_PDMODE_FIELD, mcp4728_pd_mode);
-	}
-
-	outbuf[1] |= FIELD_PREP(MCP4728_GAIN_FIELD, ch->g_mode);
-	outbuf[1] |= FIELD_PREP(MCP4728_DAC_H_FIELD, ch->dac_value >> 8);
-	outbuf[2] = FIELD_PREP(MCP4728_DAC_L_FIELD, ch->dac_value);
+	outbuf[1] |= FIELD_PREP(MCP4728_GAIN_MASK, ch->g_mode);
+	outbuf[1] |= FIELD_PREP(MCP4728_DAC_H_MASK, ch->dac_value >> 8);
+	outbuf[2] = FIELD_PREP(MCP4728_DAC_L_MASK, ch->dac_value);
 
 	ret = i2c_master_send(data->client, outbuf, 3);
 	if (ret < 0)
@@ -208,7 +222,7 @@ static int mcp4728_get_powerdown_mode(struct iio_dev *indio_dev,
 {
 	struct mcp4728_data *data = iio_priv(indio_dev);
 
-	return data->channel_data[chan->channel].pd_mode;
+	return data->chdata[chan->channel].pd_mode;
 }
 
 static int mcp4728_set_powerdown_mode(struct iio_dev *indio_dev,
@@ -217,7 +231,7 @@ static int mcp4728_set_powerdown_mode(struct iio_dev *indio_dev,
 {
 	struct mcp4728_data *data = iio_priv(indio_dev);
 
-	data->channel_data[chan->channel].pd_mode = mode;
+	data->chdata[chan->channel].pd_mode = mode;
 
 	return 0;
 }
@@ -257,110 +271,22 @@ static ssize_t mcp4728_write_powerdown(struct iio_dev *indio_dev,
 }
 
 static const struct iio_enum mcp4728_powerdown_mode_enum = {
-	.items = mcp4728_powerdown_modes,
+	.items	   = mcp4728_powerdown_modes,
 	.num_items = ARRAY_SIZE(mcp4728_powerdown_modes),
-	.get = mcp4728_get_powerdown_mode,
-	.set = mcp4728_set_powerdown_mode,
-};
-
-static const char *const mcp4728_vref_modes[] = {
-	"vdd_ext",
-	"internal",
-};
-
-static int mcp4728_get_vref_mode(struct iio_dev *indio_dev,
-				 const struct iio_chan_spec *chan)
-{
-	struct mcp4728_data *data = iio_priv(indio_dev);
-
-	return data->channel_data[chan->channel].ref_mode;
-}
-
-static int mcp4728_set_vref_mode(struct iio_dev *indio_dev,
-				 const struct iio_chan_spec *chan,
-				 unsigned int mode)
-{
-	struct mcp4728_data *data = iio_priv(indio_dev);
-
-	data->channel_data[chan->channel].ref_mode = mode;
-
-	if (mode == MCP4728_VREF_EXTERNAL_VDD &&
-	    data->channel_data[chan->channel].g_mode == MCP4728_GAIN_X2) {
-		dev_warn(&data->client->dev,
-			 "CH%d: Gain x2 not effective when vref is vdd, force to x1",
-			 chan->channel);
-		data->channel_data[chan->channel].g_mode = MCP4728_GAIN_X1;
-	}
-
-	return mcp4728_program_channel_cfg(chan->channel, indio_dev);
-}
-
-static const struct iio_enum mcp4728_vref_mode_enum = {
-	.items = mcp4728_vref_modes,
-	.num_items = ARRAY_SIZE(mcp4728_vref_modes),
-	.get = mcp4728_get_vref_mode,
-	.set = mcp4728_set_vref_mode,
-};
-
-static const char *const mcp4728_gain_modes[] = {
-	"x1",
-	"x2",
-};
-
-static int mcp4728_get_gain_mode(struct iio_dev *indio_dev,
-				 const struct iio_chan_spec *chan)
-{
-	struct mcp4728_data *data = iio_priv(indio_dev);
-
-	return data->channel_data[chan->channel].g_mode;
-}
-
-static int mcp4728_set_gain_mode(struct iio_dev *indio_dev,
-				 const struct iio_chan_spec *chan,
-				 unsigned int mode)
-{
-	struct mcp4728_data *data = iio_priv(indio_dev);
-	int ret;
-
-	if (mode == MCP4728_GAIN_X2 &&
-	    data->channel_data[chan->channel].ref_mode ==
-		    MCP4728_VREF_EXTERNAL_VDD) {
-		dev_err(&data->client->dev,
-			"CH%d: Gain x2 not effective when vref is vdd",
-			chan->channel);
-		return -EINVAL;
-	}
-
-	data->channel_data[chan->channel].g_mode = mode;
-
-	ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
-
-	return ret;
-}
-
-static const struct iio_enum mcp4728_gain_mode_enum = {
-	.items = mcp4728_gain_modes,
-	.num_items = ARRAY_SIZE(mcp4728_gain_modes),
-	.get = mcp4728_get_gain_mode,
-	.set = mcp4728_set_gain_mode,
+	.get	   = mcp4728_get_powerdown_mode,
+	.set	   = mcp4728_set_powerdown_mode,
 };
 
 static const struct iio_chan_spec_ext_info mcp4728_ext_info[] = {
 	{
-		.name = "powerdown",
-		.read = mcp4728_read_powerdown,
-		.write = mcp4728_write_powerdown,
+		.name	= "powerdown",
+		.read	= mcp4728_read_powerdown,
+		.write	= mcp4728_write_powerdown,
 		.shared = IIO_SEPARATE,
 	},
 	IIO_ENUM("powerdown_mode", IIO_SEPARATE, &mcp4728_powerdown_mode_enum),
 	IIO_ENUM_AVAILABLE("powerdown_mode", IIO_SHARED_BY_TYPE,
 			   &mcp4728_powerdown_mode_enum),
-	IIO_ENUM("vref_mode", IIO_SEPARATE, &mcp4728_vref_mode_enum),
-	IIO_ENUM_AVAILABLE("vref_mode", IIO_SHARED_BY_TYPE,
-			   &mcp4728_vref_mode_enum),
-	IIO_ENUM("gain_mode", IIO_SEPARATE, &mcp4728_gain_mode_enum),
-	IIO_ENUM_AVAILABLE("gain_mode", IIO_SHARED_BY_TYPE,
-			   &mcp4728_gain_mode_enum),
 	{},
 };
 
@@ -371,36 +297,68 @@ static const struct iio_chan_spec mcp4728_channels[MCP4728_N_CHANNELS] = {
 	MCP4728_CHAN(3),
 };
 
-static int mcp4728_full_scale_mV(u32 *full_scale_mV, int channel,
-				 struct mcp4728_data *data)
+static void mcp4728_get_scale_avail(enum mcp4728_scale scale,
+				    struct mcp4728_data *data, int *val,
+				    int *val2)
 {
-	int ret;
-
-	if (data->channel_data[channel].ref_mode == MCP4728_VREF_EXTERNAL_VDD)
-		ret = regulator_get_voltage(data->vdd_reg);
-	else
-		ret = 2048000;
-
-	if (ret < 0)
-		return ret;
-
-	if (ret == 0)
-		return -EINVAL;
-
-	*full_scale_mV = ret / 1000;
-	return 0;
+	*val  = data->scales_avail[scale * 2];
+	*val2 = data->scales_avail[scale * 2 + 1];
 }
 
-static u32 mcp4728_raw_to_mV(u32 raw, int channel, struct mcp4728_data *data)
+static void mcp4728_get_scale(int channel, struct mcp4728_data *data, int *val,
+			      int *val2)
 {
-	int ret;
-	u32 full_scale_mV;
+	int ref_mode = data->chdata[channel].ref_mode;
+	int g_mode   = data->chdata[channel].g_mode;
 
-	ret = mcp4728_full_scale_mV(&full_scale_mV, channel, data);
-	if (ret)
-		return ret;
+	if (ref_mode == MCP4728_VREF_EXTERNAL_VDD) {
+		mcp4728_get_scale_avail(MCP4728_SCALE_VDD, data, val, val2);
+	} else {
+		if (g_mode == MCP4728_GAIN_X1) {
+			mcp4728_get_scale_avail(MCP4728_SCALE_VINT_NO_GAIN,
+						data, val, val2);
+		} else {
+			mcp4728_get_scale_avail(MCP4728_SCALE_VINT_GAIN_X2,
+						data, val, val2);
+		}
+	}
+}
 
-	return (((raw + 1) * full_scale_mV) >> MCP4728_RESOLUTION);
+static int mcp4728_find_matching_scale(struct mcp4728_data *data, int val,
+				       int val2)
+{
+	for (int i = 0; i < MCP4728_N_SCALES; i++) {
+		if (data->scales_avail[i * 2] == val &&
+		    data->scales_avail[i * 2 + 1] == val2)
+			return i;
+	}
+	return -EINVAL;
+}
+
+static int mcp4728_set_scale(int channel, struct mcp4728_data *data, int val,
+			     int val2)
+{
+	int scale = mcp4728_find_matching_scale(data, val, val2);
+
+	if (scale < 0)
+		return scale;
+
+	switch (scale) {
+	case MCP4728_SCALE_VDD:
+		data->chdata[channel].ref_mode = MCP4728_VREF_EXTERNAL_VDD;
+		break;
+	case MCP4728_SCALE_VINT_NO_GAIN:
+		data->chdata[channel].ref_mode = MCP4728_VREF_INTERNAL_2048mV;
+		data->chdata[channel].g_mode   = MCP4728_GAIN_X1;
+		break;
+	case MCP4728_SCALE_VINT_GAIN_X2:
+		data->chdata[channel].ref_mode = MCP4728_VREF_INTERNAL_2048mV;
+		data->chdata[channel].g_mode   = MCP4728_GAIN_X2;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
 }
 
 static int mcp4728_read_raw(struct iio_dev *indio_dev,
@@ -408,25 +366,14 @@ static int mcp4728_read_raw(struct iio_dev *indio_dev,
 			    int *val2, long mask)
 {
 	struct mcp4728_data *data = iio_priv(indio_dev);
-	int ret;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		*val = data->channel_data[chan->channel].dac_value;
+		*val = data->chdata[chan->channel].dac_value;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
-		if (data->channel_data[chan->channel].ref_mode ==
-		    MCP4728_VREF_EXTERNAL_VDD)
-			ret = regulator_get_voltage(data->vdd_reg);
-		else
-			ret = 2048000;
-
-		if (ret < 0)
-			return ret;
-
-		*val = ret / 1000;
-		*val2 = MCP4728_RESOLUTION;
-		return IIO_VAL_FRACTIONAL_LOG2;
+		mcp4728_get_scale(chan->channel, data, val, val2);
+		return IIO_VAL_INT_PLUS_MICRO;
 	}
 	return -EINVAL;
 }
@@ -442,7 +389,14 @@ static int mcp4728_write_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_RAW:
 		if (val < 0 || val > GENMASK(MCP4728_RESOLUTION - 1, 0))
 			return -EINVAL;
-		data->channel_data[chan->channel].dac_value = val;
+		data->chdata[chan->channel].dac_value = val;
+		ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
+		break;
+	case IIO_CHAN_INFO_SCALE:
+		ret = mcp4728_set_scale(chan->channel, data, val, val2);
+		if (ret)
+			break;
+
 		ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
 		break;
 	default:
@@ -453,10 +407,64 @@ static int mcp4728_write_raw(struct iio_dev *indio_dev,
 	return ret;
 }
 
+static void mcp4728_init_scale_avail(enum mcp4728_scale scale, int vref_mv,
+				     struct mcp4728_data *data)
+{
+	s64 tmp;
+	int value_micro;
+	int value_int;
+
+	tmp	  = (s64)vref_mv * 1000000LL >> MCP4728_RESOLUTION;
+	value_int = div_s64_rem(tmp, 1000000LL, &value_micro);
+
+	data->scales_avail[scale * 2]	  = value_int;
+	data->scales_avail[scale * 2 + 1] = value_micro;
+}
+
+static int mcp4728_init_scales_avail(struct mcp4728_data *data)
+{
+	int ret;
+
+	ret = regulator_get_voltage(data->vdd_reg);
+	if (ret < 0)
+		return ret;
+
+	mcp4728_init_scale_avail(MCP4728_SCALE_VDD, ret / 1000, data);
+	mcp4728_init_scale_avail(MCP4728_SCALE_VINT_NO_GAIN, 2048, data);
+	mcp4728_init_scale_avail(MCP4728_SCALE_VINT_GAIN_X2, 4096, data);
+
+	return 0;
+}
+
+static int mcp4728_read_avail(struct iio_dev *indio_dev,
+			      struct iio_chan_spec const *chan,
+			      const int **vals, int *type, int *length,
+			      long info)
+{
+	struct mcp4728_data *data = iio_priv(indio_dev);
+
+	switch (info) {
+	case IIO_CHAN_INFO_SCALE:
+		*type = IIO_VAL_INT_PLUS_MICRO;
+
+		switch (chan->type) {
+		case IIO_VOLTAGE:
+			*vals	= data->scales_avail;
+			*length = MCP4728_N_SCALES * 2;
+			return IIO_AVAIL_LIST;
+		default:
+			return -EINVAL;
+		}
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct iio_info mcp4728_info = {
-	.read_raw = mcp4728_read_raw,
-	.write_raw = mcp4728_write_raw,
-	.attrs = &mcp4728_attribute_group,
+	.read_raw   = mcp4728_read_raw,
+	.write_raw  = mcp4728_write_raw,
+	.read_avail = &mcp4728_read_avail,
+	.attrs	    = &mcp4728_attribute_group,
 };
 
 static int mcp4728_suspend(struct device *dev)
@@ -480,7 +488,7 @@ static int mcp4728_resume(struct device *dev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct mcp4728_data *data = iio_priv(indio_dev);
-	int err = 0;
+	int err			  = 0;
 	unsigned int i;
 
 	data->powerdown = false;
@@ -516,25 +524,15 @@ static int mcp4728_init_channels_data(struct mcp4728_data *data)
 	}
 
 	for (i = 0; i < MCP4728_N_CHANNELS; i++) {
-		struct mcp4728_channel_data *ch = &data->channel_data[i];
-		u8 r2 = inbuf[i * 6 + 1];
-		u8 r3 = inbuf[i * 6 + 2];
-		u32 dac_mv;
+		struct mcp4728_channel_data *ch = &data->chdata[i];
+		u8 r2				= inbuf[i * 6 + 1];
+		u8 r3				= inbuf[i * 6 + 2];
 
-		ch->dac_value = FIELD_GET(MCP4728_DAC_H_FIELD, r2) << 8 | FIELD_GET(MCP4728_DAC_L_FIELD, r3);
-		ch->ref_mode  = FIELD_GET(MCP4728_VREF_FIELD, r2);
-		ch->pd_mode   = FIELD_GET(MCP4728_PDMODE_FIELD, r2);
-		ch->g_mode    = FIELD_GET(MCP4728_GAIN_FIELD, r2);
-
-		if (ch->g_mode == MCP4728_GAIN_X2 && ch->ref_mode == MCP4728_VREF_EXTERNAL_VDD)
-			dev_warn(&data->client->dev,
-				 "CH%d: Gain x2 not effective when vref is vdd",
-				 i);
-
-		dac_mv = mcp4728_raw_to_mV(ch->dac_value, i, data);
-		dev_dbg(&data->client->dev,
-			"CH%d: Voltage=%dmV VRef=%d PowerDown=%d Gain=%d\n", i,
-			dac_mv, ch->ref_mode, ch->pd_mode, ch->g_mode);
+		ch->dac_value = FIELD_GET(MCP4728_DAC_H_MASK, r2) << 8 |
+				FIELD_GET(MCP4728_DAC_L_MASK, r3);
+		ch->ref_mode = FIELD_GET(MCP4728_VREF_MASK, r2);
+		ch->pd_mode  = FIELD_GET(MCP4728_PDMODE_MASK, r2);
+		ch->g_mode   = FIELD_GET(MCP4728_GAIN_MASK, r2);
 	}
 
 	return 0;
@@ -545,9 +543,9 @@ static void mcp4728_reg_disable(void *reg)
 	regulator_disable(reg);
 }
 
-static int mcp4728_probe(struct i2c_client *client)
+static int mcp4728_probe(struct i2c_client *client,
+			 const struct i2c_device_id *id)
 {
-	const struct i2c_device_id *id = i2c_client_get_device_id(client);
 	struct mcp4728_data *data;
 	struct iio_dev *indio_dev;
 	int err;
@@ -568,10 +566,16 @@ static int mcp4728_probe(struct i2c_client *client)
 	if (err)
 		return err;
 
-	err = devm_add_action_or_reset(&client->dev, mcp4728_reg_disable, data->vdd_reg);
+	err = devm_add_action_or_reset(&client->dev, mcp4728_reg_disable,
+				       data->vdd_reg);
 	if (err)
 		return err;
 
+	/* MCP4728 has internal EEPROM that save each channel boot configuration.
+	 * It means that device configuration is unknown to the driver at kernel boot.
+	 * mcp4728_init_channels_data reads back DAC settings and stores them in data
+	 * structure.
+	*/
 	err = mcp4728_init_channels_data(data);
 	if (err) {
 		dev_err(&client->dev,
@@ -579,13 +583,19 @@ static int mcp4728_probe(struct i2c_client *client)
 		return err;
 	}
 
-	indio_dev->name = id->name;
-	indio_dev->info = &mcp4728_info;
-	indio_dev->channels = mcp4728_channels;
-	indio_dev->num_channels = MCP4728_N_CHANNELS;
-	indio_dev->modes = INDIO_DIRECT_MODE;
+	err = mcp4728_init_scales_avail(data);
+	if (err) {
+		dev_err(&client->dev, "failed to init scales\n");
+		return err;
+	}
 
-	return iio_device_register(indio_dev);
+	indio_dev->name		= id->name;
+	indio_dev->info		= &mcp4728_info;
+	indio_dev->channels	= mcp4728_channels;
+	indio_dev->num_channels = MCP4728_N_CHANNELS;
+	indio_dev->modes	= INDIO_DIRECT_MODE;
+
+	return devm_iio_device_register(&client->dev, indio_dev);
 }
 
 static const struct i2c_device_id mcp4728_id[] = {
