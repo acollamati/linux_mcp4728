@@ -23,6 +23,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
+#include <linux/version.h>
 
 #define MCP4728_RESOLUTION	  12
 #define MCP4728_N_CHANNELS	  4
@@ -285,8 +286,12 @@ static const struct iio_chan_spec_ext_info mcp4728_ext_info[] = {
 		.shared = IIO_SEPARATE,
 	},
 	IIO_ENUM("powerdown_mode", IIO_SEPARATE, &mcp4728_powerdown_mode_enum),
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
 	IIO_ENUM_AVAILABLE("powerdown_mode", IIO_SHARED_BY_TYPE,
 			   &mcp4728_powerdown_mode_enum),
+#else
+	IIO_ENUM_AVAILABLE("powerdown_mode", &mcp4728_powerdown_mode_enum),
+#endif
 	{},
 };
 
@@ -327,7 +332,8 @@ static void mcp4728_get_scale(int channel, struct mcp4728_data *data, int *val,
 static int mcp4728_find_matching_scale(struct mcp4728_data *data, int val,
 				       int val2)
 {
-	for (int i = 0; i < MCP4728_N_SCALES; i++) {
+	int i;
+	for (i = 0; i < MCP4728_N_SCALES; i++) {
 		if (data->scales_avail[i * 2] == val &&
 		    data->scales_avail[i * 2 + 1] == val2)
 			return i;
@@ -346,19 +352,18 @@ static int mcp4728_set_scale(int channel, struct mcp4728_data *data, int val,
 	switch (scale) {
 	case MCP4728_SCALE_VDD:
 		data->chdata[channel].ref_mode = MCP4728_VREF_EXTERNAL_VDD;
-		break;
+		return 0;
 	case MCP4728_SCALE_VINT_NO_GAIN:
 		data->chdata[channel].ref_mode = MCP4728_VREF_INTERNAL_2048mV;
 		data->chdata[channel].g_mode   = MCP4728_GAIN_X1;
-		break;
+		return 0;
 	case MCP4728_SCALE_VINT_GAIN_X2:
 		data->chdata[channel].ref_mode = MCP4728_VREF_INTERNAL_2048mV;
 		data->chdata[channel].g_mode   = MCP4728_GAIN_X2;
-		break;
+		return 0;
 	default:
 		return -EINVAL;
 	}
-	return 0;
 }
 
 static int mcp4728_read_raw(struct iio_dev *indio_dev,
@@ -390,21 +395,16 @@ static int mcp4728_write_raw(struct iio_dev *indio_dev,
 		if (val < 0 || val > GENMASK(MCP4728_RESOLUTION - 1, 0))
 			return -EINVAL;
 		data->chdata[chan->channel].dac_value = val;
-		ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
-		break;
+		return mcp4728_program_channel_cfg(chan->channel, indio_dev);
 	case IIO_CHAN_INFO_SCALE:
 		ret = mcp4728_set_scale(chan->channel, data, val, val2);
 		if (ret)
-			break;
+			return ret;
 
-		ret = mcp4728_program_channel_cfg(chan->channel, indio_dev);
-		break;
+		return mcp4728_program_channel_cfg(chan->channel, indio_dev);
 	default:
-		ret = -EINVAL;
-		break;
+		return -EINVAL;
 	}
-
-	return ret;
 }
 
 static void mcp4728_init_scale_avail(enum mcp4728_scale scale, int vref_mv,
@@ -467,7 +467,13 @@ static const struct iio_info mcp4728_info = {
 	.attrs	    = &mcp4728_attribute_group,
 };
 
+
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
 static int mcp4728_suspend(struct device *dev)
+#else
+static int __maybe_unused mcp4728_suspend(struct device *dev)
+#endif
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct mcp4728_data *data = iio_priv(indio_dev);
@@ -484,7 +490,11 @@ static int mcp4728_suspend(struct device *dev)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
 static int mcp4728_resume(struct device *dev)
+#else
+static int __maybe_unused mcp4728_resume(struct device *dev)
+#endif
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct mcp4728_data *data = iio_priv(indio_dev);
@@ -502,8 +512,13 @@ static int mcp4728_resume(struct device *dev)
 	return err;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(mcp4728_pm_ops, mcp4728_suspend,
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+	static DEFINE_SIMPLE_DEV_PM_OPS(mcp4728_pm_ops, mcp4728_suspend,
 				mcp4728_resume);
+#else
+	static SIMPLE_DEV_PM_OPS(mcp4728_pm_ops, mcp4728_suspend, mcp4728_resume);
+#endif
 
 static int mcp4728_init_channels_data(struct mcp4728_data *data)
 {
@@ -513,14 +528,12 @@ static int mcp4728_init_channels_data(struct mcp4728_data *data)
 
 	ret = i2c_master_recv(data->client, inbuf, MCP4728_READ_RESPONSE_LEN);
 	if (ret < 0) {
-		dev_err(&data->client->dev,
-			"failed to read mcp4728 conf. Err=%d\n", ret);
-		return ret;
+		return dev_err_probe(&data->client->dev, ret,
+				     "failed to read mcp4728 conf.\n");
 	} else if (ret != MCP4728_READ_RESPONSE_LEN) {
-		dev_err(&data->client->dev,
+		return dev_err_probe(&data->client->dev, -EIO,
 			"failed to read mcp4728 conf. Wrong Response Len ret=%d\n",
 			ret);
-		return -EIO;
 	}
 
 	for (i = 0; i < MCP4728_N_CHANNELS; i++) {
@@ -571,22 +584,22 @@ static int mcp4728_probe(struct i2c_client *client,
 	if (err)
 		return err;
 
-	/* MCP4728 has internal EEPROM that save each channel boot configuration.
-	 * It means that device configuration is unknown to the driver at kernel boot.
-	 * mcp4728_init_channels_data reads back DAC settings and stores them in data
-	 * structure.
-	*/
+	/*
+	 * MCP4728 has internal EEPROM that save each channel boot
+	 * configuration. It means that device configuration is unknown to the
+	 * driver at kernel boot. mcp4728_init_channels_data() reads back DAC
+	 * settings and stores them in data structure.
+	 */
 	err = mcp4728_init_channels_data(data);
 	if (err) {
-		dev_err(&client->dev,
+		return dev_err_probe(&client->dev, err,
 			"failed to read mcp4728 current configuration\n");
-		return err;
 	}
 
 	err = mcp4728_init_scales_avail(data);
 	if (err) {
-		dev_err(&client->dev, "failed to init scales\n");
-		return err;
+		return dev_err_probe(&client->dev, err,
+				     "failed to init scales\n");
 	}
 
 	indio_dev->name		= id->name;
@@ -614,7 +627,11 @@ static struct i2c_driver mcp4728_driver = {
 	.driver = {
 		.name = "mcp4728",
 		.of_match_table = mcp4728_of_match,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
 		.pm = pm_sleep_ptr(&mcp4728_pm_ops),
+#else
+		.pm = &mcp4728_pm_ops,
+#endif
 	},
 	.probe = mcp4728_probe,
 	.id_table = mcp4728_id,
